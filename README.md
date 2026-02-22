@@ -2,7 +2,7 @@
 
 这是一个基于 Python的图形界面工具，主要用于解析包含增益图 (Gain Map) 的 Ultra HDR 图像，并将其通过的光电转换计算，渲染为标准的 ST.2084 (PQ) HDR 图像文件。
 
-本项目支持自动提取 Android Ultra HDR 格式的内嵌图层与元数据，也支持手动分别导入 SDR 基础层与 Gain Map 层。最终可输出带有原生 cICP 标签的 16-bit 无损 PNG 或 10-bit AVIF 格式。
+本项目支持自动提取 Android Ultra HDR 格式的内嵌图层与元数据，也支持手动分别导入 SDR 基础层与 Gain Map 层。最终可输出Windows11支持的 16-bit 无损 PNG （Edge浏览器支持）或 10-bit AVIF （自带照片app支持）格式。
 
 ## ✨ 主要特性 (Features)
 
