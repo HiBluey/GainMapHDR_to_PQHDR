@@ -58,10 +58,6 @@ MATRIX_P3_TO_2020 = [
 # 二进制 HDR 标签强行注入函数 (PNG使用)
 # ==========================================
 def inject_hdr_metadata_to_png(png_bytes):
-    # Color Primaries = 9 (Rec. 2020)
-    # Transfer Characteristics = 16 (SMPTE ST 2084 / PQ)
-    # Matrix Coefficients = 0 (RGB)
-    # Video Full Range Flag = 1 (Full Range)
     cicp_data = struct.pack('>BBBB', 9, 16, 0, 1)
     cicp_type = b'cICP'
     crc = zlib.crc32(cicp_type + cicp_data) & 0xffffffff
@@ -91,7 +87,10 @@ class HDRCalculatorApp:
         self.gm_cap_min = tk.DoubleVar(value=0.0) 
         self.gm_cap_max = tk.DoubleVar(value=4.0) 
         
-        self.sdr_white = tk.DoubleVar(value=100.0)
+        self.sdr_white = tk.DoubleVar(value=203.0)
+        
+        # 【新增】硬件 HDR/SDR 线性比率变量 (默认给你的 4.92)
+        self.hw_hdr_ratio = tk.DoubleVar(value=4.92)
         
         # 是否保存分层图片的复选框变量
         self.save_layers_var = tk.BooleanVar(value=False)
@@ -151,6 +150,10 @@ class HDRCalculatorApp:
         lf3.pack(fill="x", pady=10)
         ttk.Label(lf3, text="SDR白点亮度 (nits):").grid(row=0, column=0, padx=5, pady=10)
         ttk.Entry(lf3, textvariable=self.sdr_white, width=15).grid(row=0, column=1)
+
+        # 【新增】硬件 HDR/SDR 亮度比率输入框
+        ttk.Label(lf3, text="硬件 HDR/SDR 线性比率:").grid(row=0, column=2, padx=(30,5), pady=10)
+        ttk.Entry(lf3, textvariable=self.hw_hdr_ratio, width=15).grid(row=0, column=3)
 
         # 选项框：是否同时输出图层
         ttk.Checkbutton(main_frame, text="同时输出保存 SDR 基础层与 Gain Map 增益层图片", variable=self.save_layers_var).pack(pady=(10, 0))
@@ -339,7 +342,6 @@ class HDRCalculatorApp:
             dir_path = os.path.dirname(self.current_filepath)
             base_name = os.path.splitext(os.path.basename(self.current_filepath))[0]
 
-            # 根据勾选状态决定是否保存图层
             if self.save_layers_var.get():
                 self.log("💾 正在将提取出的底层 SDR 与 Gain Map 独立保存为图片...")
                 base_out_path = os.path.join(dir_path, f"{base_name}_Base.png")
@@ -370,11 +372,30 @@ class HDRCalculatorApp:
             b_offset_arr = np.array([v.get() for v in self.base_offset], dtype=np.float32)
             a_offset_arr = np.array([v.get() for v in self.alt_offset], dtype=np.float32)
 
+            # 【新增核心逻辑】结合硬件HDR/SDR比例计算真实的 Weight Factor
+            hw_ratio = self.hw_hdr_ratio.get()
+            cap_min = self.gm_cap_min.get()  # 图片的底层 Headroom（对数空间）
+            cap_max = self.gm_cap_max.get()  # 图片的峰值 Headroom（对数空间）
+            
+            # 将线性的硬件比率转入对数空间 (安全控制 >= 1.0 避免数学错误)
+            if hw_ratio < 1.0: hw_ratio = 1.0
+            disp_log2 = math.log2(hw_ratio)
+            
+            # 使用 ISO 21496-1 标准公式计算内插权重
+            if cap_max > cap_min:
+                weight_factor = (disp_log2 - cap_min) / (cap_max - cap_min)
+                weight_factor = max(0.0, min(1.0, weight_factor))  # 严格限制在 0.0 ~ 1.0
+            else:
+                weight_factor = 1.0
+                
+            self.log(f"⚙️ 硬件比率: {hw_ratio}x (log2空间={disp_log2:.3f})")
+            self.log(f"⚙️ 最终算出 GainMap 权重因子(Weight Factor): {weight_factor:.4f}")
+
+            # 进行图像矩阵运算
             log_recovery_arr = np.power(gain_arr, 1.0 / gamma_arr)
             log_boost_arr = min_arr * (1.0 - log_recovery_arr) + max_arr * log_recovery_arr
             
-            weight_factor = 1.0 
-            
+            # 应用算出的动态 Weight Factor
             linear_hdr_rel_arr = np.maximum(0.0, (linear_sdr_arr + b_offset_arr) * np.exp2(log_boost_arr * weight_factor) - a_offset_arr)
             absolute_nits_arr = linear_hdr_rel_arr * self.sdr_white.get()
 
@@ -386,6 +407,7 @@ class HDRCalculatorApp:
                 trans_matrix = np.array(MATRIX_P3_TO_2020, dtype=np.float32)
                 absolute_nits_arr = np.dot(absolute_nits_arr, trans_matrix.T)
 
+            # SMPTE ST 2084 (PQ 转换)
             L_arr = np.clip(absolute_nits_arr / 10000.0, 0.0, 1.0)
             m1 = 2610.0 / 16384.0
             m2 = (2523.0 / 4096.0) * 128.0  
@@ -419,7 +441,8 @@ class HDRCalculatorApp:
                 out_path = os.path.join(dir_path, f"{base_name}_NativeHDR.avif")
                 avif_bytes = imagecodecs.avif_encode(
                     pq_10bit_arr_contiguous,
-                    level=85,             
+                    level=95,             
+                    speed=8,          
                     bitspersample=10,     
                     primaries=9,          
                     transfer=16,          
@@ -431,15 +454,11 @@ class HDRCalculatorApp:
                 self.log(f"✅ 已生成10-bit AVIF HDR 位于: \n{out_path}")
 
         except Exception as e:
-            # 完整输出 Traceback 到界面和弹窗
             err_details = traceback.format_exc()
             messagebox.showerror("计算错误", f"渲染过程中发生错误:\n\n{e}\n\n请查看运行日志获取详细报错堆栈。")
             self.log(f"❌ 运行报错堆栈:\n{err_details}")
 
 if __name__ == "__main__":
-    # ==========================================
-    # 终极错误兜底策略 (拦截任何未知导致的顶层崩溃)
-    # ==========================================
     try:
         root = tk.Tk()
         app = HDRCalculatorApp(root)
@@ -447,13 +466,11 @@ if __name__ == "__main__":
     except Exception as e:
         err_msg = traceback.format_exc()
         try:
-            # 尝试通过弹窗显示致命错误
             import tkinter.messagebox as mb
             error_root = tk.Tk()
             error_root.withdraw()
             mb.showerror("致命崩溃", f"程序运行遇到未捕获的致命错误:\n\n{err_msg}")
         except:
-            # 连弹窗库都无法调用的情况，直接打印并阻塞命令行关闭
             print("=== 发生致命错误 ===")
             print(err_msg)
             input("\n按回车键退出程序...")
