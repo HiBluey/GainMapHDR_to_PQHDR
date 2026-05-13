@@ -16,10 +16,9 @@ import threading
 import ctypes
 
 # ==========================================
-# 唤醒 Windows 高 DPI 感知 (解决内嵌画面被裁剪和界面模糊问题)
+# 唤醒 Windows 高 DPI 感知
 # ==========================================
 try:
-    # 告诉 Windows 当前应用自己处理缩放，不要强行拉伸
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
     pass
@@ -28,7 +27,7 @@ except Exception:
 # 拦截导入错误
 # ==========================================
 try:
-    from PIL import Image, ImageCms
+    from PIL import Image, ImageCms, ExifTags
     import numpy as np
     import cv2  
     import imagecodecs
@@ -66,15 +65,14 @@ class MPVPreviewer:
             "--vo=gpu-next",
             "--target-colorspace-hint=yes",
             f"--input-ipc-server={self.pipe_path}",
-            "--hwdec=auto" # 开启硬解，降低 CPU 占用
+            "--hwdec=auto"
         ]
 
-        # 【修复核心】：去除 autofit，禁止拖拽，让 MPV 完全贴合容器
         if wid is not None:
             cmd.append(f"--wid={wid}")
             cmd.append("--no-border")
             cmd.append("--force-window=immediate")
-            cmd.append("--no-window-dragging") # 防止在内嵌画面上拖拽导致坐标错乱
+            cmd.append("--no-window-dragging") 
         else:
             cmd.append("--force-window=yes")
 
@@ -156,7 +154,7 @@ class HDRCalculatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Gain Map HDR转PQ HDR (Pro Edition)")
-        self.root.geometry("1400x900")
+        self.root.geometry("1600x900") # 加宽窗口以适应三栏布局
         
         self.apply_dark_theme()
         
@@ -187,11 +185,10 @@ class HDRCalculatorApp:
         self.bind_events()
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
         self.root.after(200, self.init_mpv_engine)
 
     def init_mpv_engine(self):
-        self.log("🚀 正在将 MPV 渲染引擎挂载到右侧视窗...")
+        self.log("🚀 正在将 MPV 渲染引擎挂载到中间视窗...")
         wid = self.preview_frame.winfo_id()
         if self.previewer.start(wid=wid):
             self.log("✅ MPV 渲染引擎挂载成功！")
@@ -234,16 +231,22 @@ class HDRCalculatorApp:
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
         
-        # 高 DPI 状态下左侧留出足够空间
+        # ====== 1. 左侧面板 (参数控制) ======
         left_frame = ttk.Frame(main_paned, width=480)
         left_frame.pack_propagate(False) 
         
+        # ====== 2. 中间面板 (MPV 预览区) ======
         self.preview_frame = tk.Frame(main_paned, bg="black", bd=0, highlightthickness=0, width=800, height=800)
+        
+        # ====== 3. 右侧面板 (EXIF 信息区) ======
+        right_frame = ttk.Frame(main_paned, width=300)
+        right_frame.pack_propagate(False) 
         
         main_paned.add(left_frame, weight=0)
         main_paned.add(self.preview_frame, weight=1)
+        main_paned.add(right_frame, weight=0)
 
-        # ====== 左侧区域内容 ======
+        # ----------------- 左侧区域构建 -----------------
         top_btn_frame = ttk.LabelFrame(left_frame, text=" 图像加载 ")
         top_btn_frame.pack(fill="x", pady=(0, 10))
         ttk.Button(top_btn_frame, text="⚡ 自动提取 Ultra HDR (推荐)", style='Accent.TButton', command=self.import_image_metadata).pack(fill="x", padx=10, pady=8)
@@ -319,6 +322,14 @@ class HDRCalculatorApp:
         self.log_text = tk.Text(self.res_frame, state="disabled", bg="#1e1e1e", fg="#a9b7c6", insertbackground="white", bd=0, highlightthickness=0, font=("Consolas", 10))
         self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
 
+        # ----------------- 右侧区域构建 (EXIF) -----------------
+        self.exif_frame = ttk.LabelFrame(right_frame, text=" 📷 EXIF 核心元数据 ")
+        self.exif_frame.pack(fill="both", expand=True, padx=(10, 0)) # 左边留点缝隙隔开 MPV
+        
+        # 文本框使用纵向滚动布局
+        self.exif_text = tk.Text(self.exif_frame, state="disabled", bg="#1e1e1e", fg="#a9b7c6", insertbackground="white", bd=0, highlightthickness=0, font=("Consolas", 10))
+        self.exif_text.pack(fill="both", expand=True, padx=5, pady=5)
+
     def bind_events(self):
         vars_to_bind = [
             *self.gm_gamma, *self.gm_min, *self.gm_max, 
@@ -344,6 +355,47 @@ class HDRCalculatorApp:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
+
+    # ==========================================
+    # 解析并提取 EXIF 信息
+    # ==========================================
+    def update_exif_display(self, img):
+        """从 Base 图层提取并排版 EXIF 数据展示在右侧面板"""
+        self.exif_text.config(state="normal")
+        self.exif_text.delete(1.0, tk.END)
+        
+        try:
+            exif = img.getexif()
+            if not exif:
+                self.exif_text.insert(tk.END, "\n👻 未检测到 EXIF 信息。\n\n这可能是一张被压缩/抹除过元数据的图片。")
+            else:
+                lines = []
+                
+                # 1. 提取最基础的 EXIF 字典 (型号、软件等)
+                for k, v in exif.items():
+                    tag = ExifTags.TAGS.get(k, k)
+                    # 过滤掉极其庞大的二进制数据块 (比如 MakerNote, PrintIM)
+                    if isinstance(v, bytes) or len(str(v)) > 50: continue
+                    lines.append(f"[{tag}]\n {v}\n")
+                
+                # 2. 提取更详细的摄影参数 (光圈、快门、ISO等保存在 ExifOffset 0x8769 里)
+                if hasattr(exif, 'get_ifd'):
+                    try:
+                        ifd_data = exif.get_ifd(0x8769)
+                        for k, v in ifd_data.items():
+                            tag = ExifTags.TAGS.get(k, k)
+                            if isinstance(v, bytes) or len(str(v)) > 50: continue
+                            lines.append(f"[{tag}]\n {v}\n")
+                    except Exception:
+                        pass
+                        
+                display_str = "\n".join(lines) if lines else "无可用文本格式的 EXIF。"
+                self.exif_text.insert(tk.END, display_str)
+                
+        except Exception as e:
+            self.exif_text.insert(tk.END, f"EXIF 读取失败: {e}")
+            
+        self.exif_text.config(state="disabled")
 
     # ==========================================
     # 实时预览核心逻辑
@@ -502,6 +554,9 @@ class HDRCalculatorApp:
                     self.base_img = Image.open(io.BytesIO(data[:primary_end])).convert("RGB")
                     self.gain_img = Image.open(io.BytesIO(data[next_soi:])).convert("RGB")
                     self.log(f"✅ 提取成功! Base:{self.base_img.size}, Gain:{self.gain_img.size}")
+                    
+                    # 【核心挂载点 1】：自动提取图片时，调用刷新右侧面板 EXIF 的方法
+                    self.update_exif_display(self.base_img)
                     self.schedule_preview() 
                 else:
                     self.log("⚠️ 未发现 Gain Map流。")
@@ -514,6 +569,9 @@ class HDRCalculatorApp:
             self.current_filepath = filepath
             self.base_img = Image.open(filepath).convert("RGB")
             self.log(f"✅ 基础层导入成功: {self.base_img.size}")
+            
+            # 【核心挂载点 2】：单独导入基础层时，调用刷新右侧面板 EXIF 的方法
+            self.update_exif_display(self.base_img)
             self.schedule_preview()
 
     def import_gain_image(self):
@@ -609,7 +667,16 @@ class HDRCalculatorApp:
             self.log(f"❌ 运行报错堆栈:\n{traceback.format_exc()}")
 
     def on_closing(self):
+        """退出时释放资源并清理生成的缓存图像"""
         self.previewer.close()
+        try:
+            temp_dir = tempfile.gettempdir()
+            for i in range(3):
+                tmp_file = os.path.join(temp_dir, f"mpv_hdr_preview_{i}.png")
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+        except:
+            pass
         self.root.destroy()
 
 if __name__ == "__main__":
